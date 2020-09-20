@@ -1,0 +1,233 @@
+---
+title: "Using Leaflet to Look at NYC Flights"
+output:
+  html_document:
+    df_print: paged
+    highlight: tango
+---
+```{r global-options, include = FALSE}
+
+knitr::opts_chunk$set(fig.width=3, fig.height=4, dpi= 800,
+                      echo=TRUE, warning=FALSE, message=FALSE)
+```
+# Introduction
+
+The NYC flights dataset contains information about flights coming in and out
+of NYC. We can inspect the first few elements here. 
+
+```{r}
+library(nycflights13); library(rvest); library(tidyverse)
+head(flights)
+```
+
+Let's say we would like to visualize this dataset using leaflet. The problem
+is that we have a bunch of airport codes but we don't know what city they're in
+It would be nice if we had it mapped out for us (e.g. LAX = Los Angeles) but
+unfortunately that is not the case.
+
+Good news is that information is easily available on the web! One doesn't have
+to look to far to see a table of airport codes and the city they belong to.
+
+Looking at the site http://www.leonardsguide.com/us-airport-codes.shtml we see
+a nice table already made for us.
+
+**But how do I get that data though?**
+
+We can employ R's awesome "rvest" package for web scraping whatever we'd like.
+
+Webscraping is relatively intuitive. There only a few functions we need:
+
+- read_html() scrapes the programming from the site.
+
+- read_nodes() returns the data contained in certain HTML "nodes"
+
+- html_text() converts this to text
+
+# WebScrape the Airport codes
+
+Let's see what it looks like in action
+```{r}
+
+html.scrape <- read_html("http://www.leonardsguide.com/us-airport-codes.shtml")
+```
+
+Now the tricky part is seeing which nodes contain our data. Here it would be
+wise use chrome dev tools to see which node contains the info. Here it looks
+like the <td> node contains the data.
+
+```{r}
+codes <- html.scrape %>% html_nodes("td") %>% html_text()
+```
+
+Let's take a moment to recap:
+
+- We read in the entire html code contained in the site
+- We found the node that contains our information
+- We got the data with html_nodes()
+- We converted into text with html_text()
+
+But it is still not in a format we would like. It should be a dataframe with
+state, city, and airport code as columns instead of a long vector. Now comes 
+the power of the tidyverse.
+
+```{r}
+codes <- as.data.frame(codes)
+show(as_tibble(codes))
+```
+
+Looking at the above, at first glance it would seem difficult to get this into
+the data frame we want. We also can see one observation that we need to fix...
+
+You can see that some airports have the word "Airport" attached to their
+name, while others do not. This makes it hard to distinguish which is an
+airport and what is not. We know that any 3 letter airport code must have a
+preceding airport in the element above it. Let's write code to write the word
+"Airport" to any element that needs it.
+
+**Example:**
+
+**We see that MOB's airport name is "Mobile" and should be "Mobile Airport"**
+
+```{r}
+#loop through dataframe
+for(i in 1:nrow(codes)){
+
+  #find 3 letter airport codes
+  if(nchar(codes[[i,1]]) == 3){
+    
+    #check if the string above it contains the word "Airport"
+    if(!str_detect(codes[[i-1,1]], "Airport")){
+      
+      #if it doesn't then write the word "Airport" at the end
+      codes[[i-1, 1]] <- paste(codes[[i-1,1]], "Airport", sep = " ")
+    }
+  }
+}
+
+```
+
+Now we can take full advantage of R's separate function.
+
+```{r}
+#use R's separate function as we need to separate 3 times
+
+#first regex splits anything thats 2 letters or 3 letters or contains "Airport"
+#now you see why we needed to add the word Airport to a few elements
+regexp1 <- "(?=(^...$|^..$))|(?=.*(?<=Airport))"
+
+#splits only airports
+regexp2 <- "(?=.*(?<=Airport))"
+
+#splits only 3 letters
+regexp3 <- "(?=(^...$))"
+
+#now we perform a sweeping data clean
+codes <- codes %>%
+  separate(col = 1,into = c("State", "StateAbbr"),
+           sep = regexp1,extra = "merge") %>% 
+  separate(col = 2,into = c("StateAbbr", "Airport"),
+           sep = regexp2,extra="merge") %>% 
+  separate(col = 2, into = c("StateAbbr","AirportCode"), 
+           sep = regexp3, extra = "merge") %>% 
+  mutate(
+    StateAbbr = lead(StateAbbr), 
+    AirportCode = lead(AirportCode, n = 3),
+    Airport = lead(Airport, n = 2)
+    ) %>% 
+  drop_na() %>% 
+  na_if("") %>% 
+  fill(State,StateAbbr)
+
+```
+
+Now look at that gorgeous dataframe
+```{r}
+show(as_tibble(codes))
+```
+
+The next step is to join our custom dataframe to the nycflights dataframe.
+
+We run into an issue however... the nycflights isn't necessarily tidy. We'd
+ideally like to join on origin or destination, but which one? The problem here
+is that we can't because it is **not tidy**. We need to adjust those columns
+such that we have the airport code in one column and the "type" (either origin
+or departure in the other).
+
+```{r}
+tidy.flights <- flights %>% 
+  pivot_longer(cols = c(origin,dest), names_to = "airport_code_type",
+               values_to = "AirportCode")
+
+tidy.flights <- tidy.flights %>% 
+  left_join(codes, by = "AirportCode") %>% 
+  drop_na()
+```
+
+# Advanced Web Scraping
+Not done yet. To see flight data we need the latitude and longitude of the
+airports. Let's scrape this site:
+www.dices.net/movil/airports/airports-United_States-US-1.html
+
+The issue here is that our data is spread across **multiple pages** or URLs.
+```{r}
+#need to use lapply with paste or paste0
+coords.html <- lapply(
+paste0(
+ "http://www.dices.net/movil/airports/airports-United_States-US-",1:103,".html"
+),function(url){
+    url %>% #pass in URL
+    read_html() %>% #get html
+    html_nodes("b") %>% #get node data
+    html_text() #make it text
+})
+#returns only the the 5th-84th elements as the others are not needed
+coords.html <- lapply(coords.html, function(x){x[5:84]})
+
+#start extracting
+coords.vec <- unlist(coords.html) #unlist into vector
+AirportCodes <- str_extract(coords.vec, "^...$") #get 3 letter codes
+latlong <- str_extract(coords.vec, "(\\d.*)|(-\\d.*)") #get the digits
+
+#combine latlong into a single element
+for(i in seq(3,(length(latlong)-1),4)){
+  latlong[i] <- paste0(latlong[i],",",latlong[i+1])
+}
+
+#extracts the combined latlong elements 
+latlong <- str_extract(latlong,".*,.*")
+
+coords <- data.frame(AirportCode = AirportCodes, latlong = latlong) %>% 
+  mutate(AirportCode = lead(AirportCode), latlong = lead(latlong, n = 2)) %>% 
+  drop_na() %>% 
+  separate(latlong, c("lat","long"), sep = ",") %>% #now we can split on the ","
+  mutate(lat = as.numeric(lat),
+         long = as.numeric(long)) #convert from string
+```
+
+Now we can finally join in Airport Code
+```{r}
+final <- coords %>% left_join(tidy.flights, by = "AirportCode") %>%
+  drop_na() 
+```
+
+Finally! Look at that dataframe
+```{r}
+show(as_tibble(final))
+```
+
+# Visualizing the NYC flight destinations
+
+We filter by "dest" and see all the flight destinations from NY. It is important to note that leaflet looks for lat/long columns automatically.
+**Please zoom in and out to see the clusters**
+
+```{r}
+library(leaflet)
+
+dests <- final %>% filter(airport_code_type == "dest")
+
+leaflet(dests,height = 350, width = 400) %>%
+  setView(lat = 38, lng = -97, zoom = 4) %>% 
+  addTiles() %>% 
+  addMarkers(clusterOptions = markerClusterOptions())
+```
+
